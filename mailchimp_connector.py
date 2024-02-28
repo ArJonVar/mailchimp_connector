@@ -7,7 +7,6 @@ from mailchimp_marketing.api_client import ApiClientError
 from globals import mailchimp_token, bamb_token, smartsheet_token
 import smartsheet
 from smartsheet_grid import grid
-from globals import smartsheet_token
 import hashlib
 from datetime import datetime
 import pandas as pd
@@ -187,9 +186,11 @@ class Mailchimp_Connector():
     def audit_post_duplicates(self):
         '''creates list of posts that should not be posted as they would be exact duplicates (email, fname, lname, description, action)'''
         self.dont_post = []
-        sheet = grid(self.api_action_ssid)
-        sheet.fetch_content()
-        posted = sheet.df.to_dict('records')
+        self.sheet = grid(self.api_action_ssid)
+        self.sheet.fetch_content()
+        # does not consider it a duplication if the problem was resolved and it came back. The mechanic is to remove rows where there is a non null resolved date
+        filtered_df = self.sheet.df[self.sheet.df['Resolved Flag Date'].isnull()]
+        posted = filtered_df.to_dict('records')
 
         # checks if post [email, fname, lname, description, status] already exists in the smartsheet (with diff date and ignoring other columns)
         for post in self.post_data:
@@ -199,6 +200,12 @@ class Mailchimp_Connector():
             for existing_row in posted:
                 if all(item in existing_row.items() for item in might_post.items()):
                     self.dont_post.append(post)
+    def gen_blank_row_id_list(self):
+        '''delete blank rows after posting to clean sheet up'''
+        filtered_df = self.sheet.df[self.sheet.df['Email Address'].isnull()]
+        blank_row_ids = filtered_df['id'].tolist()
+
+        return blank_row_ids
     def post_to_ss(self):
         '''posts all to ss'''
         self.audit_post_duplicates()
@@ -218,7 +225,13 @@ class Mailchimp_Connector():
             self.rows.append(row)
 
         self.ss_post = self.smart.Sheets.add_rows(self.api_action_ssid, self.rows)
+        try:
+            self.ss_delete_blank = self.smart.Sheets.delete_rows(self.api_action_ssid, self.gen_blank_row_id_list())
+        except: 
+            # will fail there are no blanks
+            pass
         self.post_update_stamp()
+        self.logr.log('posting complete!')
     def post_update_stamp(self):
         '''posts date to summary column to tell ppl when the last time this script succeeded was'''
         sum = smartsheet.models.SummaryField({
@@ -240,11 +253,20 @@ class Mailchimp_Connector():
         exceptions_lower = []
         for exception_key in self.exceptions:
             for exception in self.exceptions[exception_key]:
-                exceptions_lower.append(exception.lower())
+                try:
+                    exceptions_lower.append(exception.lower())
+                except AttributeError:
+                    pass
         for bamb in self.all_employees.get('employees'):
-            bamb_lower.append(bamb.get("workEmail").lower())
+            try: 
+                bamb_lower.append(bamb.get("workEmail").lower())
+            except AttributeError:
+                pass
         for mc in self.all_members:
-            mc_lower.append(mc.get('email_address').lower())
+            try:
+                mc_lower.append(mc.get('email_address').lower())
+            except AttributeError:
+                pass
         self.email_reference_dict = {'bhr':bamb_lower, 'mc':mc_lower, 'exceptions':exceptions_lower}
     def initial_add_remove(self):
         '''creates initial dict of additions and removals'''
@@ -299,31 +321,62 @@ class Mailchimp_Connector():
         self.action_reference['remove']=remove_final
     def extract_post_data(self):
         '''turning list of actions into post dict for smartsheet logger'''
+        for member in self.all_members:
+            if member['status'] != 'subscribed':
+                email = member['email_address']
+                fname, lname = member['full_name'].split(' ')
+                status = member['status']
+                self.post_data.append({
+                    'First Name': fname, 
+                    'Last Name': lname, 
+                    'Email Address': email, 
+                    'Action': 'Flagged', 
+                    'Further Description': f"{email} has a status of {status}. They will need a status of 'subscribed' to receive any emails from mailchimp", 
+                    'Script Date': self.iso_str, 
+                    'Intended Action': "Identify Non-Subscribers"})
+                
         for action in self.action_reference:
             if action == "remove":
-                for email in self.action_reference.get(action):
+                for email in self.action_reference.get(action, []):  # Ensure default to empty list if action key doesn't exist
+                    first_name, last_name = None, None  # Initialize variables outside the loops
                     for member in self.all_members:
-                        if email == member.get("email_address").lower():
-                            if member.get("full_name")[0] == ' ':
-                                full_name = member.get("full_name")[1:]
-                            else:
-                                full_name = member.get("full_name")
-                            first_name = full_name.split(" ")[0]
-                            last_name = full_name.split(" ")[1]
-                    self.post_data.append({'First Name': first_name, 'Last Name': last_name, 'Email Address': email, 'Action': 'Removed', 'Further Description': f"{email} was found in Mailchimp, but not in BambooHR. Now the user is being archived from Mailchimp", 'Script Date':self.iso_str, 'Intended Action':"Remove"})
+                        member_email = member.get("email_address", "").lower()
+                        if email.lower() == member_email:  # Ensuring case-insensitive comparison
+                            full_name = member.get("full_name", "").strip()  # Handles leading space in full name
+                            name_parts = full_name.split(" ")
+                            if len(name_parts) >= 2:  # Ensure there's at least a first name and last name
+                                first_name, last_name = name_parts[0], name_parts[1]
+                                # Additional logic if there are middle names or suffixes not covered here
+                                break  # Assuming only one match is needed, exit the loop once found
+                    if first_name and last_name:  # Ensure first_name and last_name were found
+                        self.post_data.append({
+                            'First Name': first_name, 
+                            'Last Name': last_name, 
+                            'Email Address': email, 
+                            'Action': 'Removed', 'Further Description': f"{email} was found in Mailchimp, but not in BambooHR. Now the user is being archived from Mailchimp", 
+                            'Script Date': self.iso_str, 
+                            'Intended Action': "Remove"})
 
             if action == "add":
                 for email in self.action_reference.get(action):
-                    for employee in self.all_employees.get("employees"):
-                        if email == employee.get("workEmail").lower():
+                    for employee in self.all_employees.get("employees", []):  # Ensure default to empty list if "employees" key doesn't exist
+                        work_email = employee.get("workEmail")
+                        if work_email and email.lower() == work_email.lower():  # Check if work_email is not None and then compare
                             try:
-                                first_name = employee.get('preferredName')
+                                first_name = employee.get('preferredName', employee.get('firstName'))  # Simplified logic
                                 if first_name == None:
                                     first_name = employee.get('firstName')
                             except:
                                 first_name = employee.get('firstName')
                             last_name = employee.get("lastName")
-                    self.post_data.append({'First Name': first_name, 'Last Name': last_name, 'Email Address': email, 'Action': 'Added', 'Further Description': f"{email} was found in BambooHR but not in MailChimp. User is now being added to Mailchimp", 'Script Date':self.iso_str, 'Intended Action':"Add"})
+                    self.post_data.append({
+                        'First Name': first_name, 
+                        'Last Name': last_name, 
+                        'Email Address': email, 
+                        'Action': 'Added', 
+                        'Further Description': f"{email} was found in BambooHR but not in MailChimp. User is now being added to Mailchimp", 
+                        'Script Date':self.iso_str, 
+                        'Intended Action':"Add"})
     #endregion
     def run(self):
         '''runs main script as intended'''
